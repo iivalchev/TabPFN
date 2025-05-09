@@ -49,7 +49,8 @@ from tabpfn.preprocessing import (
     EnsembleConfig,
     PreprocessorConfig,
     RegressorEnsembleConfig,
-    default_regressor_preprocessor_configs,
+    default_regressor_preprocessor_configs, DatasetCollectionWithPreprocessing,
+    ClassifierEnsembleConfig,
 )
 from tabpfn.utils import (
     _fix_dtypes,
@@ -63,7 +64,7 @@ from tabpfn.utils import (
     translate_probs_across_borders,
     update_encoder_outlier_params,
     validate_X_predict,
-    validate_Xy_fit,
+    validate_Xy_fit, split_large_data,
 )
 
 if TYPE_CHECKING:
@@ -71,6 +72,7 @@ if TYPE_CHECKING:
     from sklearn.compose import ColumnTransformer
     from sklearn.pipeline import Pipeline
     from torch.types import _dtype
+    from torch.utils.data import Dataset
 
     from tabpfn.constants import (
         XType,
@@ -402,17 +404,56 @@ class TabPFNRegressor(RegressorMixin, BaseEstimator):
         tags.estimator_type = "regressor"
         return tags
 
-    @config_context(transform_output="default")  # type: ignore
-    def fit(self, X: XType, y: YType) -> Self:
-        """Fit the model.
+    def get_preprocessed_datasets(
+        self,
+        X: XType | list[XType],
+        y: YType | list[YType],
+        split_fn,
+        max_data_size: None | int = 10000,
+    ) -> Dataset:
+        """Get a torch.utils.data.Dataset which contains many datasets or splits of one
+        or more datasets.
 
         Args:
-            X: The input data.
-            y: The target variable.
-
-        Returns:
-            self
+            X: list of input dataset features
+            y: list of input dataset labels
+            split_fn: A function to dissect a dataset into train and test partition.
+            max_data_size: Maximum allowed number of samples in one dataset.
+            If None, dataseta are not splitted.
         """
+        if not isinstance(X, list):
+            X = [X]
+
+        if not isinstance(y, list):
+            y = [y]
+            assert len(X) == len(y)
+
+        if not hasattr(self, "model_") or self.model_ is None:
+            _, static_seed, rng = self._initialize_model_variables()
+        else:
+            static_seed, rng = infer_random_state(self.random_state)
+
+        X_split, y_split = [], []
+        for X_item, y_item in zip(X, y):
+            if max_data_size is not None:
+                Xparts, yparts = split_large_data(X_item, y_item, max_data_size)
+            else:
+                Xparts, yparts = [X_item], [y_item]
+            X_split.extend(Xparts)
+            y_split.extend(yparts)
+        X, y = X_split, y_split
+        config_collection = []
+        for X_item, y_item in zip(X, y):
+            configs, X_mod, y_mod = self._initialize_dataset_preprocessing(
+                X_item, y_item, static_seed, rng
+            )
+            config_collection.append(
+                [configs, X_mod, y_mod, self.inferred_categorical_indices_]
+            )
+        return DatasetCollectionWithPreprocessing(split_fn, rng, config_collection)
+
+    def _initialize_model_variables(self) -> tuple[
+        int, int, np.random.Generator]:
         static_seed, rng = infer_random_state(self.random_state)
 
         # Load the model and config
@@ -446,6 +487,11 @@ class TabPFNRegressor(RegressorMixin, BaseEstimator):
             inplace=True,
         )
 
+        return byte_size, static_seed, rng
+
+    def _initialize_dataset_preprocessing(
+        self, X: XType, y: YType, static_seed, rng
+    ) -> tuple[list[ClassifierEnsembleConfig], XType, YType]:
         X, y, feature_names_in, n_features_in = validate_Xy_fit(
             X,
             y,
@@ -523,14 +569,34 @@ class TabPFNRegressor(RegressorMixin, BaseEstimator):
         y = (y - self.y_train_mean_) / self.y_train_std_
         self.renormalized_criterion_ = FullSupportBarDistribution(
             self.bardist_.borders * self.y_train_std_ + self.y_train_mean_,
-        ).float()
+            ).float()
+
+        return ensemble_configs, X, y
+
+
+    @config_context(transform_output="default")  # type: ignore
+    def fit(self, X: XType, y: YType) -> Self:
+        """Fit the model.
+
+        Args:
+            X: The input data.
+            y: The target variable.
+
+        Returns:
+            self
+        """
+        byte_size, static_seed, rng = self._initialize_model_variables()
+
+        self._ensemble_configs, X, y = self._initialize_dataset_preprocessing(
+            X, y, static_seed, rng
+        )
 
         # Create the inference engine
         self.executor_ = create_inference_engine(
             X_train=X,
             y_train=y,
             model=self.model_,
-            ensemble_configs=ensemble_configs,
+            ensemble_configs=self._ensemble_configs,
             cat_ix=self.inferred_categorical_indices_,
             fit_mode=self.fit_mode,
             device_=self.device_,
