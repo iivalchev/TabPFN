@@ -45,6 +45,9 @@ from tabpfn.model.bar_distribution import FullSupportBarDistribution
 from tabpfn.model.preprocessing import (
     ReshapeFeatureDistributionsStep,
 )
+from tabpfn.inference import (
+    InferenceEngineBatchedNoPreprocessing
+)
 from tabpfn.preprocessing import (
     EnsembleConfig,
     PreprocessorConfig,
@@ -610,6 +613,57 @@ class TabPFNRegressor(RegressorMixin, BaseEstimator):
 
         return self
 
+    def fit_from_preprocessed(
+        self,
+        X_preprocessed: list[torch.Tensor],
+        y_preprocessed: list[torch.Tensor],
+        cat_ix: list[list[int]],
+        configs: list[list[EnsembleConfig]],
+        *,
+        no_refit=True,
+    ) -> TabPFNRegressor:
+        """Fit the model to preprocessed inputs from a Dataset provided by
+        get_preprocessed_datasets.
+
+        Args:
+            X_preprocessed: The input features obtained from the preprocessed Dataset
+                The list contains one item for each ensemble predictor.
+                use tabpfn.utils.collate_for_tabpfn_dataset to use this function with
+                batch sizes of more than one dataset (see examples/tabpfn_finetune.py)
+            y_preprocessed: The target variable obtained from the preprocessed Dataset
+            cat_ix: categorical indices obtained from the preprocessed Dataset
+            configs: Ensemble configurations obtained from the preprocessed Dataset
+            no_refit: if True, the classifier will not be reinitialized when calling
+                fit multiple times.
+        """
+        # If there isa model, and we are lazy, we skip reinitialization
+        if not hasattr(self, "model_") or not no_refit:
+            byte_size, _, _ = self._initialize_model_variables()
+        else:
+            _, _, byte_size = determine_precision(
+                self.inference_precision, self.device_
+            )
+
+        # Create the inference engine
+        self.executor_ = create_inference_engine(
+            X_train=X_preprocessed,
+            y_train=y_preprocessed,
+            model=self.model_,
+            ensemble_configs=configs,
+            cat_ix=cat_ix,
+            fit_mode="batched",
+            device_=self.device_,
+            rng=None,
+            n_jobs=self.n_jobs,
+            byte_size=byte_size,
+            forced_inference_dtype_=self.forced_inference_dtype_,
+            memory_saving_mode=self.memory_saving_mode,
+            use_autocast_=self.use_autocast_,
+            inference_mode=True,
+        )
+
+        return self
+
     @overload
     def predict(
         self,
@@ -827,6 +881,89 @@ class TabPFNRegressor(RegressorMixin, BaseEstimator):
             np.ndarray: The computed embeddings for each fitted estimator.
         """
         return _get_embeddings(self, X, data_source)
+
+    def predict_from_preprocessed(self, X: list[torch.Tensor]) -> list[torch.Tensor]:
+        # assert correct type of inference engine
+        if not isinstance(self.executor_, InferenceEngineBatchedNoPreprocessing):
+            raise ValueError(
+                "Error using batched mode: \
+                predict_from_preprocessed can only be called \
+                following fit_from_preprocessed."
+            )
+        self.executor_.use_torch_inference_mode(use_inference=False)
+        std_borders = self.bardist_.borders.cpu().numpy()
+        outputs: list[list[torch.Tensor]] = []
+        borders: list[list[np.ndarray]] = []
+        for output, config in self.executor_.iter_outputs(
+            X,
+            device=self.device_,
+            autocast=self.use_autocast_,
+        ):
+            # output is of shape (seq, batch, bar_dist_dim)
+            assert output.ndim == 3  # [Batch, Nsamples, Logits]
+            if self.softmax_temperature != 1:
+                output = output.float() / self.softmax_temperature  # noqa: PLW2901
+            # todo why config can be None
+            if config is not None:
+                outputs_batch: list[torch.Tensor] = []
+                borders_batch: list[np.ndarray] = []
+                for i, batch_config in enumerate(config):
+                    borders_t: np.ndarray
+                    logit_cancel_mask: np.ndarray | None
+                    descending_borders: bool
+
+                    # TODO(eddiebergman): Maybe this could be parallelized or done in fit
+                    # but I somehow doubt it takes much time to be worth it.
+                    # One reason to make it worth it is if you want fast predictions, i.e.
+                    # don't re-do this each time.
+                    # However it gets a bit more difficult as you need to line up the
+                    # outputs from `iter_outputs` above (which may be in arbitrary order),
+                    # along with the specific config the output belongs to. This is because
+                    # the transformation done to the borders for a given output is dependant
+                    # upon the target_transform of the config.
+                    if batch_config.target_transform is None:
+                        borders_t = std_borders.copy()
+                        logit_cancel_mask = None
+                    else:
+                        logit_cancel_mask, descending_borders, borders_t = (
+                            _transform_borders_one(
+                                std_borders,
+                                target_transform=batch_config.target_transform,
+                                repair_nan_borders_after_transform=self.interface_config_.FIX_NAN_BORDERS_AFTER_TARGET_TRANSFORM,
+                            )
+                        )
+                        if descending_borders:
+                            borders_t = borders_t.flip(-1)  # type: ignore
+
+                    borders_batch.append(borders_t)
+
+                    if logit_cancel_mask is not None:
+                        output = output.clone()  # noqa: PLW2901
+                        output[..., logit_cancel_mask] = float("-inf")
+
+                    outputs_batch.append(output[:, i, :])  # type: ignore
+
+                borders.append(borders_batch)
+                outputs.append(outputs_batch)
+
+        transformed_logits = [
+            [
+                translate_probs_across_borders(
+                    logits,
+                    frm=torch.as_tensor(borders_t, device=self.device_),
+                    to=self.bardist_.borders.to(self.device_),
+                )
+                for logits, borders_t in zip(outputs_batch, borders_batch)
+            ]
+            for outputs_batch, borders_batch in zip(outputs, borders)
+        ]
+
+        stacked_logits = [
+            torch.stack(transformed_logits_batch, dim=0)
+            for transformed_logits_batch in transformed_logits
+        ]
+
+        return [self.renormalized_criterion_.mean(logits) for logits in stacked_logits]
 
 
 def _logits_to_output(
