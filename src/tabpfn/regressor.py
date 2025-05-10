@@ -958,12 +958,12 @@ class TabPFNRegressor(RegressorMixin, BaseEstimator):
             for outputs_batch, borders_batch in zip(outputs, borders)
         ]
 
-        stacked_logits = [
+        return [
             torch.stack(transformed_logits_batch, dim=0)
             for transformed_logits_batch in transformed_logits
         ]
 
-        return [self.renormalized_criterion_.mean(logits) for logits in stacked_logits]
+
 
 
 def _logits_to_output(
