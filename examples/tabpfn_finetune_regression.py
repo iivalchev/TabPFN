@@ -66,11 +66,16 @@ if __name__ == "__main__":
             preds = reg.predict_from_preprocessed(X_tests)
             loss = lossfn(preds, y_tests.to(device))
             loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                reg.model_.parameters(),
+                max_norm=1.0,
+                error_if_nonfinite=False,
+            ).item()
+            print(
+                f"grad norm: {grad_norm}; grad norm (after clipping): {torch.tensor([p.grad.norm() for p in reg.model_.parameters()]).norm()}"
+            )
             optim_impl.step()
             print("Train Loss:", loss)
-            print(
-                f"grad norm: {torch.tensor([p.grad.norm() for p in reg.model_.parameters()]).norm()}"
-            )
 
         loss_test = eval_test(reg, my_dl_test, lossfn)
         print(f"---- EPOCH {epoch}: ----")
