@@ -41,19 +41,18 @@ from tabpfn.base import (
     initialize_tabpfn_model,
 )
 from tabpfn.config import ModelInterfaceConfig
+from tabpfn.inference import InferenceEngineBatchedNoPreprocessing
 from tabpfn.model.bar_distribution import FullSupportBarDistribution
 from tabpfn.model.preprocessing import (
     ReshapeFeatureDistributionsStep,
 )
-from tabpfn.inference import (
-    InferenceEngineBatchedNoPreprocessing
-)
 from tabpfn.preprocessing import (
+    ClassifierEnsembleConfig,
+    DatasetCollectionWithPreprocessing,
     EnsembleConfig,
     PreprocessorConfig,
     RegressorEnsembleConfig,
-    default_regressor_preprocessor_configs, DatasetCollectionWithPreprocessing,
-    ClassifierEnsembleConfig,
+    default_regressor_preprocessor_configs,
 )
 from tabpfn.utils import (
     _fix_dtypes,
@@ -64,10 +63,11 @@ from tabpfn.utils import (
     infer_categorical_features,
     infer_device_and_type,
     infer_random_state,
+    split_large_data,
     translate_probs_across_borders,
     update_encoder_outlier_params,
     validate_X_predict,
-    validate_Xy_fit, split_large_data,
+    validate_Xy_fit,
 )
 
 if TYPE_CHECKING:
@@ -962,7 +962,6 @@ class TabPFNRegressor(RegressorMixin, BaseEstimator):
             torch.stack(transformed_logits_batch, dim=0)
             for transformed_logits_batch in transformed_logits
         ]
-
 
 
 
