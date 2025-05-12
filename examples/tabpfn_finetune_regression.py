@@ -32,16 +32,16 @@ if __name__ == "__main__":
 
     # Load Diabetes Dataset (regression)
     data_frame_x, data_frame_y = sklearn.datasets.load_diabetes(return_X_y=True)
-    splitfn = partial(train_test_split, test_size=0.3)
+    splitfn = partial(train_test_split, test_size=0.3, random_state=42)
     X_train, X_test, y_train, y_test = splitfn(data_frame_x, data_frame_y)
 
     reg = TabPFNRegressor(n_estimators=4)
 
     datasets_list = reg.get_preprocessed_datasets(X_train, y_train, splitfn)
     datasets_list_test = reg.get_preprocessed_datasets(X_test, y_test, splitfn)
-    my_dl_train = DataLoader(datasets_list, batch_size=2, collate_fn=collate_for_tabpfn_dataset)
+    my_dl_train = DataLoader(datasets_list, batch_size=1, collate_fn=collate_for_tabpfn_dataset)
     my_dl_test = DataLoader(
-        datasets_list_test, batch_size=3, collate_fn=collate_for_tabpfn_dataset
+        datasets_list_test, batch_size=1, collate_fn=collate_for_tabpfn_dataset
     )
 
     def lossfn(logits_per_config: list[torch.Tensor], y_true: torch.Tensor):
@@ -67,10 +67,11 @@ if __name__ == "__main__":
             preds = reg.predict_from_preprocessed(X_tests)
             loss = lossfn(preds, y_tests.to(device))
             loss.backward()
+            optim_impl.step()
+            print("Train Loss:", loss)
             print(
                 f"grad norm: {torch.tensor([p.grad.norm() for p in reg.model_.parameters()]).norm()}"
             )
-            optim_impl.step()
 
         loss_test = eval_test(reg, my_dl_test, lossfn)
         print(f"---- EPOCH {epoch}: ----")
