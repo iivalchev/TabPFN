@@ -55,7 +55,6 @@ if __name__ == "__main__":
 
     optim_impl = Adam(reg.model_.parameters(), lr=1e-5)
     loss_batches = []
-    acc_batches = []
 
     loss_test = eval_test(reg, my_dl_test, lossfn)
     print("Initial loss:", loss_test)
